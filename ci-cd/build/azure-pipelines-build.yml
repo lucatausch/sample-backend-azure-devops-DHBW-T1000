@@ -1,0 +1,113 @@
+trigger:
+- master
+
+stages:
+- stage: build
+  jobs: 
+  - job: build
+  
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - task: Maven@3
+      inputs:
+        mavenPomFile: 'sample-backend/pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.11'
+        jdkArchitectureOption: 'x64'
+        publishJUnitResults: false
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        goals: 'package'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Pipeline.Workspace)'
+        artifact: 'T1000'
+        publishLocation: 'pipeline'
+
+    - task: Docker@1
+      displayName: 'Build-container'
+      inputs:
+        azureSubscriptionEndpoint: 'Azure-RM-portal-inf19079'
+        azureContainerRegistry: t1000container.azurecr.io
+        dockerFile: 'sample-backend/ci-cd/build/Dockerfile'
+        imageName: 't1000container.azurecr.io/praxis-1-app:$(Build.BuildId)'
+        useDefaultContext: false
+        buildContext: ./
+
+    - task: Docker@1
+      displayName: 'Push-container'
+      inputs:
+        azureSubscriptionEndpoint: 'Azure-RM-portal-inf19079'
+        azureContainerRegistry: t1000container.azurecr.io
+        command: 'Push an image'
+        imageName: 't1000container.azurecr.io/praxis-1-app:$(Build.BuildId)'
+
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Push-JaCoCo'
+      inputs:
+        codeCoverageTool: 'JaCoCo'
+        summaryFileLocation: 'sample-backend/target/site/jacoco/jacoco.xml'
+        reportDirectory: 'sample-backend/target/site/jacoco/'
+
+- stage: deploy
+  jobs:
+    - job: deploy
+
+      pool:
+        vmImage: 'ubuntu-latest'
+
+      steps:
+      - task: AzureWebAppContainer@1
+        displayName: 'Azure Web App on Container Deploy: T1000-web-app-dev'
+        inputs:
+          azureSubscription: 'Azure-RM-portal-inf19079'
+          appName: 'T1000-web-app-dev'
+          containers: 't1000container.azurecr.io/praxis-1-app:$(Build.BuildId)'
+          appSettings: '-WEBSITES_PORT 8080'
+
+- stage: OwaspZapTest
+  jobs:
+  - job: OWASP
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - task: CmdLine@2
+      inputs:
+        script: |
+          docker pull owasp/zap2docker-stable
+
+          docker run -d --name owasp_zap -u zap -p 8080:8080 -i owasp/zap2docker-stable zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=* -config api.addrs.addr.regex=true
+          
+          curl -X PUT -H "Content-Type: application/json" -d '{"firstName":"Tony","lastName":"Stark"}' https://t1000-web-app-dev.azurewebsites.net/api/student/
+
+          curl https://t1000-web-app-dev.azurewebsites.net/api/student/
+          echo
+
+          docker exec owasp_zap zap-cli --verbose spider https://t1000-web-app-dev.azurewebsites.net/api/student
+          docker exec owasp_zap zap-cli --verbose active-scan --recursive https://t1000-web-app-dev.azurewebsites.net/api/student
+          
+          docker exec owasp_zap zap-cli report -f xml -o testResult.xml
+          docker cp owasp_zap:/zap/testResult.xml .
+          
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $XslPath = "$($Env:SYSTEM_DEFAULTWORKINGDIRECTORY)/sample-backend/ci-cd/build/OWASPToNUnit3.xslt"
+          $XmlInputPath = "$($Env:SYSTEM_DEFAULTWORKINGDIRECTORY)/testResult.xml"
+          $XmlOutputPath = "$($Env:SYSTEM_DEFAULTWORKINGDIRECTORY)/Converted-testResult.xml"
+          $XslTransform = New-Object System.Xml.Xsl.XslCompiledTransform
+          $XslTransform.Load($XslPath) 
+          $XslTransform.Transform($XmlInputPath, $XmlOutputPath)
+
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      inputs:
+        testResultsFiles: Converted-testResult.xml
+        testResultsFormat: NUnit
